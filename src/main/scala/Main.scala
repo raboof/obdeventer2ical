@@ -2,8 +2,6 @@ import java.io.{ InputStream, OutputStream }
 import java.nio.charset.Charset
 import java.time._
 
-import com.amazonaws.services.lambda.runtime.{ Context, RequestStreamHandler }
-
 import scala.language.implicitConversions
 import scala.language.postfixOps
 
@@ -27,7 +25,11 @@ import net.ruippeixotog.scalascraper.dsl.DSL.Extract._
 import net.ruippeixotog.scalascraper.dsl.DSL.Parse._
 
 trait Main {
-  implicit val ec: ectrace.WrappedExecutionContext = ectrace.WrappedExecutionContext(ExecutionContext.global)
+  import scala.util.Try
+  object ToInt {
+    def unapply(in: String): Option[Int] = Try(in.toInt).toOption
+  }
+  implicit val ec: ExecutionContext = ExecutionContext.global
   implicit def liftOption[T](value: T): Option[T] = Some(value)
 
   def links(doc: Document): List[String] =
@@ -67,42 +69,53 @@ trait Main {
     val browser = JsoupBrowser()
 
     // JsoupBrowser.get expects UTF-8, vvvdeventer is windows codepage
-    Http(dispatch.url(uri) OK dispatch.as.String.charset(Charset.forName("windows-1252"))).map {
+    Http(dispatch.url(uri) OK dispatch.as.String).map {
       val doc = browser.parseString(_)
       doc
     }
   }
 
-  def event(url: String): Future[Event] = {
-    fetchDocument(url).map(doc => parseEvent(url, doc))
+  def event(element: Element): Event = {
+    val url = element >> attr("href")("a")
+    val id = url.filter(_.isDigit)
+    val time = element >> text(".time_overview")
+    val datePattern = """\w\w (\d+)-(\d+), (\d+):(\d+) uur""".r
+    val date = time match {
+      case datePattern(ToInt(day), ToInt(month), ToInt(hour), ToInt(minute)) =>
+        ZonedDateTime.parse(f"2017-$month%02d-$day%02dT$hour%02d:$minute%02d:00+02:00[Europe/Amsterdam]").withZoneSameInstant(ZoneOffset.UTC)
+    }
+    val title = element >> text(".titelbalk2")
+    val lines = element >> elementList(".movie_event_desc li")
+    val body = (lines(2) >> text("li")).replaceAll(" ... lees meer", "")
+    Event(
+      uid = Uid(s"fdk2ical-$id"),
+      summary = Summary(title),
+      description = Description(body),
+      dtstart = date,
+      url = Url(url)
+    )
   }
 
+  def events(doc: Document): Iterable[Event] = (doc >> elements(".movie_event")).map(event(_))
+
   def fetchCalendar(): String = {
-    val now = java.time.LocalDate.now()
-    val urlPrefix =
-      s"http://www.deventer.info/nl/agenda/jaarkalender?sub=30&f_agenda_start_date=01-${now.getMonth.ordinal + 1}-${now.getYear}&f_agenda_end_date=31-12-${now.getYear}&start="
-    val futures: Seq[Future[List[Event]]] = Range(0, 5)
-      .map(urlPrefix + _ + "0")
-      .map(url => fetchDocument(url).flatMap(doc => Future.sequence(links(doc).map(event))))
+    val urlPrefix = "http://www.filmhuisdekeizer.nl/programma/"
 
-    val results: List[Event] = Await.result(Future.sequence(futures), 120 seconds).flatten.toList
-
+    val results = Await.result(fetchDocument(urlPrefix + "specials/").map(events(_)), 120 seconds)
 
     // ec.dumpToFile("timeline.data")
     asIcal(Calendar(
-      prodid = Prodid("-//raboof/vvv2ical//NONSGML v1.0//NL"),
-      events = results
+      prodid = Prodid("-//raboof/fdk2ical//NONSGML v1.0//NL"),
+      events = results.toList
     ))
   }
 }
 
 class MainLambda extends Main {
-  def handleRequest(inputStream: InputStream, outputStream: OutputStream, context: Context): Unit = {
-    context.getLogger().log("starting\n")
+  def handleRequest(inputStream: InputStream, outputStream: OutputStream): Unit = {
     val result = fetchCalendar()
     outputStream.write(result.getBytes("UTF-8"));
     outputStream.flush();
-    context.getLogger().log("returning\n")
   }
 }
 

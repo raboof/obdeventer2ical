@@ -10,22 +10,16 @@ import org.scalatest._
 
 class Test extends WordSpec with Matchers with Main {
   "The HTML scraping algorithm" should {
-    "correctly find links in a yearly overview page" in {
+    "correctly find events on the specials page" in {
       val browser = JsoupBrowser()
-      val doc = browser.parseResource("/jaarkalender.html")
-      links(doc).size should be(10)
-    }
+      val elems = events(browser.parseResource("/specials.html"))
+      elems.size should be(6)
 
-    "correctly convert a details page to an event" in {
-      val browser = JsoupBrowser()
-      val doc = browser.parseResource("/details.html", "Windows-1252")
-      println(asIcal(parseEvent("http://www.deventer.info/nl/agenda/jaarkalender/agenda_id,66310", doc)))
-    }
-
-    "correctly convert a details page with an extra keyless datalist field to an event" in {
-      val browser = JsoupBrowser()
-      val doc = browser.parseResource("/opstelten.html", "Windows-1252")
-      println(asIcal(parseEvent("http://www.deventer.info/nl/agenda/jaarkalender/agenda_id,66310", doc)))
+      val rondeel = elems.head
+      rondeel.uid.value.text should be("fdk2ical-5039")
+      rondeel.url.get.value.uri.toString should be("http://www.filmhuisdekeizer.nl/programma/5039/rondeel-cinema-paradijs-binnen-handbereik")
+      rondeel.summary.get.value.text should be("Rondeel Cinema: Paradijs Binnen Handbereik")
+      rondeel.description.get.value.text should be("Te zien op 21 februari tijdens Rondeel Cinema. Met inleiding door Gerrit Lommerse. De Nederlandse tuin- en landschapsontwerper Piet Oudolf verwierf wereldfaam met zijn creaties waarmee hij de openbare ruimte voorgoed veranderd heeft. Zijn bekendste werk is")
     }
   }
 }
