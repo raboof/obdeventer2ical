@@ -99,7 +99,7 @@ trait Main {
   def events(doc: Document): Iterable[Event] = (doc >> elements(".movie_event")).map(event(_))
 
   def fetchCalendar(): String = {
-    val urlPrefix = "http://www.filmhuisdekeizer.nl/programma/"
+    val urlPrefix = "https://www.filmhuisdekeizer.nl/programma/"
 
     val results = Await.result(fetchDocument(urlPrefix + "specials/").map(events(_)), 120 seconds)
 
@@ -121,5 +121,4 @@ class MainLambda extends Main {
 
 object MainApp extends App with Main {
   print(fetchCalendar())
-  dispatch.Http.shutdown()
 }
