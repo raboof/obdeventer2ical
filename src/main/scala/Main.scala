@@ -1,111 +1,83 @@
 import java.io.{ InputStream, OutputStream }
-import java.nio.charset.Charset
 import java.time._
+
+import akka.actor.ActorSystem
 
 import scala.language.implicitConversions
 import scala.language.postfixOps
-
-import dispatch.Http
+import akka.http.scaladsl._
+import akka.http.scaladsl.model.HttpRequest
+import akka.stream.ActorMaterializer
+import akka.stream.scaladsl.StreamConverters
 
 import scala.concurrent._
 import scala.concurrent.duration._
-
 import icalendar._
 import icalendar.Properties._
 import icalendar.CalendarProperties._
-import icalendar.ValueTypes._
 import icalendar.ical.Writer._
-
 import net.ruippeixotog.scalascraper.model._
 import net.ruippeixotog.scalascraper.browser.JsoupBrowser
-import net.ruippeixotog.scalascraper.scraper.HtmlExtractor
-
 import net.ruippeixotog.scalascraper.dsl.DSL._
 import net.ruippeixotog.scalascraper.dsl.DSL.Extract._
-import net.ruippeixotog.scalascraper.dsl.DSL.Parse._
 
 trait Main {
-  import scala.util.Try
-  object ToInt {
-    def unapply(in: String): Option[Int] = Try(in.toInt).toOption
-  }
-  implicit val ec: ExecutionContext = ExecutionContext.global
+
   implicit def liftOption[T](value: T): Option[T] = Some(value)
 
-  def links(doc: Document): List[String] =
-    (doc >> elementList("#tab-agenda-list ul.list li")).map(element =>
-      (element >> elementList("a"))(1) >> attr("href")("a"))
+  implicit val system = ActorSystem()
+  implicit val ec: ExecutionContext = system.dispatcher
+  implicit val mat = ActorMaterializer()
 
-  def getDatalistFields(article: Element): Map[String, String] =
-    (article >> elements(".datalist"))
-      .flatMap(_.children.sliding(2, 2).flatMap {
-        case Seq(k, v) => Some((k >> text("dt")) -> (v >> text("dd")))
-        case Seq(_) => None
-      })
-      .toMap
-
-  def parseEvent(url: String, doc: Document): Event = {
-    val id = url.replaceAll("[^\\d]", "").toInt
-    val article = doc >> element("article")
-    val data = getDatalistFields(article)
-    val datePattern = "(\\d+)-(\\d+)-(\\d+).*".r
-    val date = data("Datum:") match {
-      case datePattern(d, m, y) => s"$y-$m-$d"
-    }
-    val starttime = "\\d+:\\d+".r.findFirstIn(data("Geopend:")).getOrElse("00:00")
-
-    Event(
-      uid = Uid(s"vvvdeventer2ical-$id"),
-      dtstart =
-        ZonedDateTime.parse(s"${date}T${starttime}+02:00[Europe/Amsterdam]").withZoneSameInstant(ZoneOffset.UTC),
-      summary = Summary(Text.fromString(article >> text("h1"))),
-      description = Description(Text.fromString(article >> text("p"))),
-      categories = List(Categories(ListType(data("Categorie:")))),
-      url = Url(url)
-    )
-  }
+  val urlPrefix = "https://www.obdeventer.nl/agenda1" // ?start=10
 
   def fetchDocument(uri: String): Future[Document] = {
     val browser = JsoupBrowser()
 
-    // JsoupBrowser.get expects UTF-8, vvvdeventer is windows codepage
-    Http(dispatch.url(uri) OK dispatch.as.String).map {
-      val doc = browser.parseString(_)
-      doc
-    }
+    Http.get(system).singleRequest(HttpRequest(uri = uri))
+      .map { response => response.entity.dataBytes.runWith(StreamConverters.asInputStream()) }
+      .map { is => browser.parseInputStream(is, "UTF-8") }
   }
 
   def event(element: Element): Event = {
-    val url = element >> attr("href")("a")
+    import RegexUtils._
+
+    //    println(element)
+    val url = (element >> attr("href")("a")).drop("/agenda1/".length)
     val id = url.filter(_.isDigit)
-    val time = element >> text(".time_overview")
-    val datePattern = """\w\w (\d+)-(\d+), (\d+):(\d+) uur""".r
-    val date = time match {
-      case datePattern(ToInt(day), ToInt(month), ToInt(hour), ToInt(minute)) =>
-        ZonedDateTime.parse(f"2017-$month%02d-$day%02dT$hour%02d:$minute%02d:00+02:00[Europe/Amsterdam]").withZoneSameInstant(ZoneOffset.UTC)
+    val dateTime = element >> text(".date")
+
+    val amsterdam = ZoneId.of("Europe/Amsterdam")
+    val now = ZonedDateTime.now(amsterdam)
+    val date = dateTime match {
+      case re"""\w+ (\d+)${ ToInt(dayOfMonth) } (\w+)${ ToMonth(month) } \((.*)$rest\)""" =>
+        val year =
+          if (month.getValue < now.getMonth.getValue) now.getYear + 1
+          else now.getYear
+        rest match {
+          case re"""(vanaf |)$v(\d+)${ ToInt(h) }\.(\d+)${ ToInt(m) }.*""" =>
+            ZonedDateTime.of(year, month.getValue, dayOfMonth, h, m, 0, 0, amsterdam)
+        }
     }
-    val title = element >> text(".titelbalk2")
-    val lines = element >> elementList(".movie_event_desc li")
-    val body = (lines(2) >> text("li")).replaceAll(" ... lees meer", "")
+    val title = element >> text("h3.titel")
+    val body = element >> text(".item-introtext")
     Event(
-      uid = Uid(s"fdk2ical-$id"),
+      uid = Uid(s"obdeventer2ical-$id"),
       summary = Summary(title),
       description = Description(body),
       dtstart = date,
-      url = Url(url)
+      url = Url(urlPrefix + "/" + url)
     )
   }
 
-  def events(doc: Document): Iterable[Event] = (doc >> elements(".movie_event")).map(event(_))
+  def events(doc: Document): Iterable[Event] = (doc >> elements(".overview li div.item-container")).map(event(_))
 
   def fetchCalendar(): String = {
-    val urlPrefix = "https://www.filmhuisdekeizer.nl/programma/"
-
-    val results = Await.result(fetchDocument(urlPrefix + "specials/").map(events(_)), 120 seconds)
+    val results = Await.result(fetchDocument(urlPrefix).map(events(_)), 120 seconds)
 
     // ec.dumpToFile("timeline.data")
     asIcal(Calendar(
-      prodid = Prodid("-//raboof/fdk2ical//NONSGML v1.0//NL"),
+      prodid = Prodid("-//raboof/obdeventer2ical//NONSGML v1.0//NL"),
       events = results.toList
     ))
   }
@@ -121,4 +93,37 @@ class MainLambda extends Main {
 
 object MainApp extends App with Main {
   print(fetchCalendar())
+  system.terminate()
+}
+
+object RegexUtils {
+  implicit class RegexHelper(val sc: StringContext) extends AnyVal {
+    def re: scala.util.matching.Regex = sc.parts.mkString.r
+  }
+
+  import scala.util.Try
+  object ToInt {
+    def unapply(in: String): Option[Int] = Try(in.toInt).toOption
+  }
+
+  object ToMonth {
+    def unapply(in: String): Option[Month] = {
+      import Month._
+      Try(in match {
+        case "januari" => JANUARY
+        case "februari" => FEBRUARY
+        case "maart" => MARCH
+        case "april" => APRIL
+        case "mei" => MAY
+        case "juni" => JUNE
+        case "juli" => JULY
+        case "augustus" => AUGUST
+        case "september" => SEPTEMBER
+        case "oktober" => OCTOBER
+        case "november" => NOVEMBER
+        case "december" => DECEMBER
+      }).toOption
+    }
+  }
+
 }
